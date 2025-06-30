@@ -3,14 +3,14 @@
 
 internal abstract class Program
 {
-    private const string TRANSFER_STUB_EXTENSION = ".transferring";
+    private const string TRANSFER_STUB_EXTENSION = ".transfer";
     
     private static void Main(string[] args)
     {
         if (args.Length != 2)
         {
             Console.WriteLine("Usage: rrs <source-folder> <destination-folder>");
-            Console.WriteLine("Example: rrs C:\\Source C:\\Backup");
+            Console.WriteLine(@"Example: rrs C:\Source C:\Backup");
             return;
         }
 
@@ -39,11 +39,21 @@ internal abstract class Program
             var stats = SyncFolders(sourcePath, destinationPath);
 
             Console.WriteLine(new string('-', 60));
-            Console.WriteLine($"Sync completed successfully!");
+            Console.WriteLine("Sync completed successfully!");
             Console.WriteLine($"Files copied: {stats.FilesCopied}");
             Console.WriteLine($"Files skipped (already up-to-date): {stats.FilesSkipped}");
             Console.WriteLine($"Directories created: {stats.DirectoriesCreated}");
             Console.WriteLine($"Incomplete transfers resumed: {stats.IncompleteTransfersResumed}");
+
+            if (stats.FilesWithDateTimeIssues.Count <= 0) return;
+            
+            Console.WriteLine($"Files skipped due to DateTime issues: {stats.FilesWithDateTimeIssues.Count}");
+            Console.WriteLine("These files require manual review:");
+            
+            foreach (string file in stats.FilesWithDateTimeIssues)
+            {
+                Console.WriteLine($"  - {file}");
+            }
         }
         catch (Exception ex)
         {
@@ -52,7 +62,7 @@ internal abstract class Program
         }
     }
 
-    static SyncStats SyncFolders(string sourcePath, string destinationPath)
+    private static SyncStats SyncFolders(string sourcePath, string destinationPath)
     {
         var stats = new SyncStats();
         
@@ -70,7 +80,7 @@ internal abstract class Program
             string fileName = Path.GetFileName(sourceFile);
             string destFile = Path.Combine(destinationPath, fileName);
 
-            var copyResult = ProcessFile(sourceFile, destFile);
+            var copyResult = ProcessFile(sourceFile, destFile, stats);
             switch (copyResult)
             {
                 case CopyResult.Copied:
@@ -84,6 +94,10 @@ internal abstract class Program
                 case CopyResult.Skipped:
                     stats.FilesSkipped++;
                     Console.WriteLine($"Skipped: {fileName} (already up-to-date)");
+                    break;
+                case CopyResult.SkippedDueToDateTimeIssue:
+                    stats.FilesSkipped++;
+                    Console.WriteLine($"Skipped: {fileName} (DateTime comparison failed)");
                     break;
             }
         }
@@ -101,12 +115,14 @@ internal abstract class Program
         return stats;
     }
 
-    static CopyResult ProcessFile(string sourceFile, string destFile)
+    private static CopyResult ProcessFile(string sourceFile, string destFile, SyncStats stats)
     {
         string stubFile = GetStubFileName(destFile);
         bool hasOrphanedStub = File.Exists(stubFile);
         
-        if (ShouldCopyFile(sourceFile, destFile, hasOrphanedStub))
+        var shouldCopyResult = ShouldCopyFile(sourceFile, destFile, hasOrphanedStub, stats);
+        
+        if (shouldCopyResult.ShouldCopy)
         {
             try
             {
@@ -117,11 +133,24 @@ internal abstract class Program
                 // Clean up stub file if copy fails
                 if (File.Exists(stubFile))
                 {
-                    try { File.Delete(stubFile); } catch { }
+                    try
+                    {
+                        File.Delete(stubFile);
+                    }
+                    catch
+                    {
+                        // ignored
+                    }
                 }
                 Console.WriteLine($"Warning: Failed to copy '{Path.GetFileName(sourceFile)}': {ex.Message}");
                 return CopyResult.Failed;
             }
+        }
+        
+        // Check if this was skipped due to a DateTime issue
+        if (shouldCopyResult.WasDueTeDateTimeIssue)
+        {
+            return CopyResult.SkippedDueToDateTimeIssue;
         }
         
         return CopyResult.Skipped;
@@ -131,42 +160,53 @@ internal abstract class Program
     {
         // Create transfer stub to indicate copy in progress
         File.WriteAllText(stubFile, $"Transfer started: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-        
-        try
-        {
-            // Perform the actual file copy
-            File.Copy(sourceFile, destFile, overwrite: true);
+
+        // Perform the actual file copy
+        File.Copy(sourceFile, destFile, overwrite: true);
             
-            // Copy successful - remove the stub
-            File.Delete(stubFile);
+        // Copy successful - remove the stub
+        File.Delete(stubFile);
             
-            return isResumedTransfer ? CopyResult.Resumed : CopyResult.Copied;
-        }
-        catch
-        {
-            // Copy failed - leave stub in place for cleanup next run
-            throw;
-        }
+        return isResumedTransfer ? CopyResult.Resumed : CopyResult.Copied;
     }
 
-    static bool ShouldCopyFile(string sourceFile, string destFile, bool hasOrphanedStub)
+    private static ShouldCopyResult ShouldCopyFile(string sourceFile, string destFile, bool hasOrphanedStub, SyncStats stats)
     {
         // Always copy if there's an orphaned stub (indicates incomplete previous transfer)
         if (hasOrphanedStub)
-            return true;
+            return new ShouldCopyResult(true, false);
 
         // Copy if destination file doesn't exist
         if (!File.Exists(destFile))
-            return true;
+            return new ShouldCopyResult(true, false);
 
-        // Copy if source file is newer than destination file
-        DateTime sourceTime = File.GetLastWriteTime(sourceFile);
-        DateTime destTime = File.GetLastWriteTime(destFile);
-        
-        return sourceTime > destTime;
+        // Try to compare file timestamps - copy if source file is newer than destination file
+        try
+        {
+            DateTime sourceTime = File.GetLastWriteTime(sourceFile);
+            DateTime destTime = File.GetLastWriteTime(destFile);
+            
+            // Validate that we got reasonable DateTime values
+            if (sourceTime == DateTime.MinValue || destTime == DateTime.MinValue ||
+                sourceTime > DateTime.Now.AddDays(1) || destTime > DateTime.Now.AddDays(1))
+            {
+                throw new InvalidOperationException("Invalid DateTime values detected");
+            }
+            
+            return new ShouldCopyResult(sourceTime > destTime, false);
+        }
+        catch (Exception ex)
+        {
+            // Log the problematic file and skip it
+            string fileName = Path.GetFileName(sourceFile);
+            stats.FilesWithDateTimeIssues.Add($"{fileName} ({ex.GetType().Name}: {ex.Message})");
+            
+            // Skip the file when we can't determine timestamps - let user decide what to do
+            return new ShouldCopyResult(false, true);
+        }
     }
 
-    static StubDetectionStats DetectOrphanedStubs(string rootPath)
+    private static StubDetectionStats DetectOrphanedStubs(string rootPath)
     {
         var stats = new StubDetectionStats();
         
@@ -177,12 +217,12 @@ internal abstract class Program
         return stats;
     }
 
-    static void DetectOrphanedStubsRecursive(string directoryPath, StubDetectionStats stats)
+    private static void DetectOrphanedStubsRecursive(string directoryPath, StubDetectionStats stats)
     {
         try
         {
             // Find all stub files in current directory
-            foreach (string stubFile in Directory.GetFiles(directoryPath, $"*{TRANSFER_STUB_EXTENSION}"))
+            foreach (var _ in Directory.GetFiles(directoryPath, $"*{TRANSFER_STUB_EXTENSION}"))
             {
                 // Count all stubs found - these represent potentially incomplete transfers
                 // Don't delete them here - let the sync process handle them
@@ -201,31 +241,28 @@ internal abstract class Program
         }
     }
 
-    static string GetStubFileName(string originalFile)
+    private static string GetStubFileName(string originalFile)
     {
         return originalFile + TRANSFER_STUB_EXTENSION;
     }
-
-    static string GetOriginalFileName(string stubFile)
-    {
-        return stubFile.Substring(0, stubFile.Length - TRANSFER_STUB_EXTENSION.Length);
-    }
 }
 
-enum CopyResult
+internal enum CopyResult
 {
     Copied,
     Resumed,
     Skipped,
-    Failed
+    Failed,
+    SkippedDueToDateTimeIssue
 }
 
-class SyncStats
+internal class SyncStats
 {
     public int FilesCopied { get; set; }
     public int FilesSkipped { get; set; }
     public int DirectoriesCreated { get; set; }
     public int IncompleteTransfersResumed { get; set; }
+    public List<string> FilesWithDateTimeIssues { get; } = [];
 
     public void Add(SyncStats other)
     {
@@ -233,10 +270,17 @@ class SyncStats
         FilesSkipped += other.FilesSkipped;
         DirectoriesCreated += other.DirectoriesCreated;
         IncompleteTransfersResumed += other.IncompleteTransfersResumed;
+        FilesWithDateTimeIssues.AddRange(other.FilesWithDateTimeIssues);
     }
 }
 
-class StubDetectionStats
+internal class StubDetectionStats
 {
     public int OrphanedStubsFound { get; set; }
+}
+
+internal class ShouldCopyResult(bool shouldCopy, bool wasDueTeDateTimeIssue)
+{
+    public bool ShouldCopy { get; } = shouldCopy;
+    public bool WasDueTeDateTimeIssue { get; } = wasDueTeDateTimeIssue;
 }
